@@ -12,7 +12,11 @@
 * **当unsortedbin上面只有一个块时，分配一个较小的块，会将这个块先放入对应的smallbin中，然后再做切割，符合条件的返回，剩余的放回unsortedbin**
 1. 从unsortedbin unlink，进入对应smallbin
 ```c
-// glibc-2.23/malloc/malloc.c#L
+// glibc-2.23/malloc/malloc.c#L3515
+	/* remove from unsorted list */
+  unsorted_chunks (av)->bk = bck;
+  bck->fd = unsorted_chunks (av);
+
 	if (in_smallbin_range (size))
     {
       victim_index = smallbin_index (size);
